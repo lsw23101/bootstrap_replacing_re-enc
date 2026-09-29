@@ -1,318 +1,83 @@
-# CKKS 기반 동적 제어기와 u/y Reconstruction 실험
+# Bootstrapping으로 re-encryption 대체하기: CKKS 동적 제어기
 
-이 저장소는 **동적 제어기의 내부 행렬 $F$가 stable 또는 unstable한 경우**, $u,y$ history를 이용한 controller-state reconstruction과 CKKS 기반 암호화 구현을 단계적으로 확인하기 위한 코드입니다.
+불안정한 내부 행렬 $F$를 가질 수 있는 선형 동적 제어기를 CKKS(OpenFHE)로 무한 시간 운용하는 연구 코드입니다.
+TAC(Kim, [arXiv:2307.16445](https://arxiv.org/abs/2307.16445))의 re-encryption을 **bootstrapping**으로 대체합니다.
+ARX 표현으로 상태 암호문 없이 입출력만으로 제어 입력 $u(t)$를 계산합니다.
 
-처음 보는 사람도 구조를 따라갈 수 있도록 다음 네 단계로 구성했습니다.
+## 먼저 읽을 것
 
-1. `01_plain_tac` — Plain TAC formulation
-2. `02_plain_uy_reconstruction` — Plain $u,y$-based reconstruction
-3. `03_openfhe_ptct_uy_reconstruction` — OpenFHE CKKS, PT-CT coefficients
-4. `04_openfhe_ctct_uy_reconstruction` — OpenFHE CKKS, CT-CT coefficients
+1. **[`tex/formulation.pdf`](tex/formulation.pdf):** 전체 정리입니다. 작업 경과 → 문제 설정 → TAC/ARX 유도 → 지연 입력창 → 블록 리셋 점프와 안정 조건 → CKKS 구현 → 허수부 문제 → 실험 결과 순서입니다.
+2. **[`CONTEXT.md`](CONTEXT.md):** 작업 대화 흐름입니다. 어떤 질문에서 무엇을 발견했고, 무엇을 결정했는지 시간 순서로 정리했습니다.
+3. [`tex/issue.pdf`](tex/issue.pdf): 허수부 누적 문제만 다룬 단독 보고서입니다.
+4. [`CLAUDE.md`](CLAUDE.md): Claude Code로 이어서 작업할 때 쓰는 규칙과 핵심 사실입니다 (자동으로 읽힙니다).
 
-> **중요:** 03/04에서 각 $u(t+i)$와 $y(t+i)$는 서로 다른 ciphertext입니다. Scalar signal은 `[value,0,0,0]` 형태로 표현하며 `[u,u,u,u]` 또는 `[y,y,y,y]` replicated packing을 사용하지 않습니다.
+## 작업 흐름 한눈에 보기
 
-자세한 ciphertext layout은 [`docs/ENCRYPTED_REPRESENTATION.md`](docs/ENCRYPTED_REPRESENTATION.md)를 먼저 확인하세요.
-
----
-
-## 1. 문제 설정
-
-Plant:
-
-```math
-x_p(k+1)=Ax_p(k)+Bu(k)
+```
+동료 저장소 (01 평문 TAC → 02 평문 u/y reconstruction → 03 PT-CT → 04 CT-CT)
+   │  500 step으로 늘리니 unstable F에서 u 오차가 ρ(F)^4 배/block으로 발산
+   ▼
+원인: bootstrapping이 CKKS 허수부를 보존 → plant는 실수부만 받음 → 허수부가 F로 개루프 전파
+   │  해결: bootstrapping 직후 c + conj(c) (레벨 소모 없음)
+   ▼
+구조 재정립: u/y reconstruction = deadbeat TAC의 ARX 형태
+   │  목표: bootstrapping된 u 입력창을 K step 재사용해서 bootstrapping 시간 확보
+   ▼
+05: 지연 입력창 ARX, CT-CT
+   │  y 패킹 (zero-padded shift register + rotate-sum)  → u 계산이 K에 대해 로그로만 증가
+   │  입력창 패킹 (창당 bootstrapping 1회)            → bootstrapping 1/K 회/step
+   ▼
+128-bit (N=65536): bootstrapping ≈ 6 s, u 계산 ≈ 0.2 s/step → K=64 선택
+   │  K=d=64에서 블록 리셋 점프가 누적되어 발산 발견 (평문에서도 동일)
+   ▼
+안정 조건 d ≤ K − n + 1  →  최종 설정 K=64, d=61: 오차 ≤ 1.1e-7 (유계), 여유 ≈ 18 s vs 필요 ≈ 6 s
 ```
 
-```math
-y(k)=Cx_p(k)
-```
+## 저장소 구성
 
-Dynamic controller:
+| 경로 | 내용 |
+|---|---|
+| `05_openfhe_ctct_arx_window/` | **현재 구현** (C++/OpenFHE). `results/`에 최종 설정 검증 run 2개 (128-bit, K=64, d=61, 640 step) |
+| `tex/` | `formulation.tex/.pdf` (전체 정리), `issue.tex/.pdf` (허수부 보고서), `figures/` |
+| `config/`, `include/` | plant/제어기 profile 정의(Python)와 생성된 C++ 헤더 |
+| `tools/` | profile 생성과 검증, 결과 plot |
+| `backup/colleague_original/` | 동료 원본 01–04와 문서. 03에는 `--clear-imag` 수정이 들어 있음 |
+| `backup/analysis_scripts/` | 문서 그림 생성과 진단 스크립트 |
+| `backup/05_results_archive/` | 비교 실험 결과. 저장소에는 `summary.csv`만 올라감 |
 
-```math
-x_c(k+1)=Fx_c(k)+Gy(k)
-```
-
-```math
-u(k)=Hx_c(k)
-```
-
-전체 closed-loop matrix는
-
-```math
-A_{cl}=
-\begin{bmatrix}
-A & BH\\
-GC & F
-\end{bmatrix}.
-```
-
-이 저장소에서는 특히
-
-```math
-\rho(F)>1,\qquad \rho(A_{cl})<1
-```
-
-인 controller realization에서도 CKKS implementation이 어떻게 동작하는지 비교합니다.
-
----
-
-## 2. Controller profile
-
-모든 단계에서 다음 세 가지 profile을 공통으로 사용합니다.
-
-| profile | $\rho(F)$ | $\rho(A_{cl})$ | 특징 |
-|---|---:|---:|---|
-| `stable` | 0.6000 | 0.6893 | Schur-stable $F$ baseline |
-| `unstable_low` | 1.0460 | 0.7852 | unstable $F$, 낮은 internal transient |
-| `unstable_high` | 1.0460 | 0.7852 | unstable $F$, 큰 internal transient |
-
-`unstable_high`는 `unstable_low`의 similarity-transformed realization입니다.
-
-```math
-F_h=TF_lT^{-1},\qquad G_h=TG_l,\qquad H_h=H_lT^{-1}.
-```
-
-초기 controller state도 함께 변환하므로 exact arithmetic에서는 두 profile의 ideal $u$와 plant trajectory가 동일합니다. 내부 realization의 numerical sensitivity만 크게 달라지도록 만든 비교 case입니다.
-
-자세한 내용은 [`docs/CONTROLLER_PROFILES.md`](docs/CONTROLLER_PROFILES.md)를 참고하세요.
-
----
-
-## 3. Repository 구조
-
-```text
-.
-├── 01_plain_tac/
-├── 02_plain_uy_reconstruction/
-├── 03_openfhe_ptct_uy_reconstruction/
-├── 04_openfhe_ctct_uy_reconstruction/
-├── config/
-├── include/
-├── tools/
-├── docs/
-└── experiments/
-```
-
-모든 단계의 기본 결과는 가능한 한 다음 형식으로 통일합니다.
-
-```text
-u.png
-plant_state.png
-u_error.png
-plant_state_error.png
-sample_trace.csv
-```
-
-성공 여부는 controller-state error 하나가 아니라 **실제 control $u$와 plant trajectory $x_p$**를 우선해서 판단합니다. Controller-state error는 numerical mechanism을 보기 위한 diagnostic입니다.
-
----
-
-## 4. Part 1 — Plain TAC
+## 재현
 
 ```bash
-python3 01_plain_tac/tac_plain.py --profile stable
-python3 01_plain_tac/tac_plain.py --profile unstable_low
-python3 01_plain_tac/tac_plain.py --profile unstable_high
+# macOS (Apple Silicon) 기준
+brew install gcc cmake
+git clone https://github.com/openfheorg/openfhe-development ~/openfhe-development
+cd ~/openfhe-development && git checkout 1306d14f   # v1.5.1
+mkdir build && cd build && CC=gcc-16 CXX=g++-16 cmake .. -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF && make -j
+cd -   # 이 저장소로
+
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+export CXX=g++-16
+./05_openfhe_ctct_arx_window/scripts/build.sh
+
+# 빠른 확인 (N=4096 연구용 파라미터, 수십 초)
+./05_openfhe_ctct_arx_window/scripts/run.sh unstable_low 16 200 OUT --pack-y --pack-u --compact-inputs
+
+# 최종 설정 (128-bit, 약 4분, 메모리 약 3.8 GB)
+./05_openfhe_ctct_arx_window/arx_window_ctct --profile unstable_low --K 64 --steps 640 \
+  --results-dir OUT --pack-y --pack-u --compact-inputs --secure128
 ```
 
-기본 controller
-
-```math
-x_c^+=Fx_c+Gy,\qquad u=Hx_c
-```
-
-와 TAC identity
-
-```math
-x_c^+=(F-RH)x_c+Gy+Ru
-```
-
-를 plain arithmetic에서 비교합니다.
-
----
-
-## 5. Part 2 — Plain u/y reconstruction
-
-기본값은 refresh period $K=4$, reconstruction horizon $\nu=4$입니다.
-
-```bash
-python3 02_plain_uy_reconstruction/uy_reconstruction_plain.py \
-  --profile unstable_low --blocks 50 --period 4 --nu 4
-```
-
-Plain 단계에서는 $K$와 $\nu$를 분리할 수 있습니다.
-
-```bash
-python3 02_plain_uy_reconstruction/uy_reconstruction_plain.py \
-  --profile unstable_low --blocks 20 --period 12 --nu 4
-```
-
-Reconstruction은
-
-```math
-x_c(t+K)=M_uU+M_yY
-```
-
-형태로 구현합니다.
-
----
-
-## 6. Part 3 — OpenFHE PT-CT
-
-여기부터 OpenFHE가 필요합니다.
-
-```bash
-export OPENFHE_ROOT="$HOME/openfhe-development"
-./03_openfhe_ptct_uy_reconstruction/scripts/build.sh
-./03_openfhe_ptct_uy_reconstruction/scripts/run.sh stable 10
-./03_openfhe_ptct_uy_reconstruction/scripts/run.sh unstable_low 10
-./03_openfhe_ptct_uy_reconstruction/scripts/run.sh unstable_high 10
-```
-
-### Signal representation
-
-Controller state만 vector packing합니다.
-
-```math
-c_x\leftrightarrow[x_1,x_2,x_3,x_4].
-```
-
-각 measurement는 개별 sparse scalar ciphertext입니다.
-
-```math
-c_{y_i}\leftrightarrow[y(t+i),0,0,0].
-```
-
-각 control도 개별 sparse scalar ciphertext입니다.
-
-```math
-c_{u_i}\leftrightarrow[u(t+i),0,0,0].
-```
-
-PT-CT에서는 $P_i$, $q_{ij}$, $M_u$, $M_y$ coefficient를 plaintext one-hot mask로 사용합니다.
-
----
-
-## 7. Part 4 — OpenFHE CT-CT
-
-```bash
-./04_openfhe_ctct_uy_reconstruction/scripts/build.sh
-./04_openfhe_ctct_uy_reconstruction/scripts/run.sh stable 10
-./04_openfhe_ctct_uy_reconstruction/scripts/run.sh unstable_low 10
-./04_openfhe_ctct_uy_reconstruction/scripts/run.sh unstable_high 10
-```
-
-Signal layout은 Part 3과 동일합니다.
-
-다만 controller/reconstruction coefficient도 setup에서 ciphertext로 암호화합니다.
-
-Control 계산의 $P_i x$는 다음 구조입니다.
-
-```math
-[p_{i1},0,0,0]\odot[x_1,x_2,x_3,x_4]
-```
-
-```math
-+[p_{i2},0,0,0]\odot[x_2,x_3,x_4,x_1]
-```
-
-```math
-+[p_{i3},0,0,0]\odot[x_3,x_4,x_1,x_2]
-```
-
-```math
-+[p_{i4},0,0,0]\odot[x_4,x_1,x_2,x_3]
-```
-
-따라서 결과는
-
-```math
-[P_i x,0,0,0]
-```
-
-입니다.
-
-$q_{ij}y_j$도 sparse scalar layout을 그대로 유지합니다.
-
-Reconstruction에서는 각 sparse scalar $u_i,y_i$를 state slot으로 rotation하여 one-hot $M_u,M_y$ coefficient와 곱합니다. 단순 replicated broadcast-sum은 사용하지 않습니다.
-
----
-
-## 8. OpenFHE diagnostic
-
-03/04에서는 ideal scalar layout이
-
-```math
-[s,0,0,0]
-```
-
-이므로 다음을 기록합니다.
-
-Active-slot error:
-
-```math
-e_{active}=|\hat s_0-s|
-```
-
-Inactive-slot leakage:
-
-```math
-e_{inactive}=\max_{r=1,2,3}|\hat s_r|.
-```
-
-`sample_trace.csv`와 `bootstrap_diagnostics.csv`에서 $u$와 $y$에 대해 이 값을 확인할 수 있습니다.
-
----
-
-## 9. Python 환경
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Profile 검증:
-
-```bash
-python3 tools/validate_profiles.py
-```
-
-Sparse layout algebra 확인:
-
-```bash
-python3 tools/verify_sparse_layout.py
-```
-
----
-
-## 10. 현재 advanced experiment 상태
-
-이전 replicated-scalar OpenFHE 구현에서 생성된 long-horizon 결과는 현재 architecture의 결과로 사용하지 않습니다.
-
-현재 v4에서는 corrected sparse-scalar implementation을 먼저 03/04에서 재검증한 뒤 다음 실험을 다시 수행할 예정입니다.
-
-- long-horizon PT-CT / CT-CT
-- same-measurement controller-error dynamics
-- post-bootstrap level/tower sweep
-- active-slot error / inactive-slot leakage
-- production-vs-fresh bootstrap comparison
-
-수정 내역은 [`docs/CORRECTION_FROM_V3.md`](docs/CORRECTION_FROM_V3.md)를 참고하세요.
-
----
-
-## 11. 권장 실행 순서
-
-```text
-01_plain_tac
-    ↓
-02_plain_uy_reconstruction
-    ↓
-03_openfhe_ptct_uy_reconstruction
-    ↓
-04_openfhe_ctct_uy_reconstruction
-```
-
-OpenFHE는 먼저 `stable` profile로 3~10 blocks를 확인한 뒤 `unstable_low`, `unstable_high` 순서로 진행하는 것을 권장합니다.
+옵션과 출력 파일 설명은 [`05_openfhe_ctct_arx_window/README.md`](05_openfhe_ctct_arx_window/README.md)에 있습니다.
+
+## 주요 결과
+
+| 항목 | 값 |
+|---|---|
+| 허수부 제거 전 (03, 500 step) | block당 $\rho(F)^4\approx1.197$배로 발산, 360 step대에서 복호화 실패 |
+| 허수부 제거 후 (03) | $u$ 오차 약 $10^{-8}$에서 유지 |
+| 05, $N=4096$, 패킹 | $u$ 오차 $\le10^{-12}$, 최소 $T_s$ 약 60–100 ms (모델) |
+| 05, 128-bit, $K=d=64$ | 블록 리셋 점프 누적으로 발산 (block당 6.8배) |
+| **05, 128-bit, $K=64$, $d=61$ (최종)** | $u$ 오차 $\le1.1\times10^{-7}$ 유계, bootstrapping 약 6 s, $u$ 계산 약 0.2 s/step, 최소 $T_s$ 약 0.3 s (모델) |
+
+최소 $T_s$는 측정 시간 기반 스케줄 모델 값입니다. bootstrapping 작업자가 별도 자원에서 병렬로 돈다고 가정합니다.
+실제 병렬 실행으로 검증하는 것은 남은 과제입니다.

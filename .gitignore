@@ -1,10 +1,19 @@
 .venv/
 __pycache__/
 *.pyc
-03_openfhe_ptct_uy_reconstruction/uy_reconstruction_ptct
-04_openfhe_ctct_uy_reconstruction/uy_reconstruction_ctct
-# Local result folders can become large; keep generated runs out of Git history.
-01_plain_tac/results/*/
-02_plain_uy_reconstruction/results/*/
-03_openfhe_ptct_uy_reconstruction/results/*/
-04_openfhe_ctct_uy_reconstruction/results/*/
+.DS_Store
+# Build outputs
+05_openfhe_ctct_arx_window/arx_window_ctct
+backup/colleague_original/03_openfhe_ptct_uy_reconstruction/uy_reconstruction_ptct
+backup/colleague_original/04_openfhe_ctct_uy_reconstruction/uy_reconstruction_ctct
+# 05_openfhe_ctct_arx_window/results/ holds only the latest reference runs and is tracked.
+# Archived comparison runs are local only (summary.csv is tracked).
+backup/05_results_archive/*/
+backup/colleague_original/*/results/*/
+# Reference paper: arXiv:2307.16445 (not redistributed)
+24_Kim_TAC_Further.pdf
+# LaTeX build files
+tex/*.aux
+tex/*.log
+tex/*.out
+tex/*.toc

@@ -1,0 +1,14 @@
+profile=unstable_high, rho_F=1.04604, rho_Acl=0.785175
+K=64, d=61, n=4, steps=640, first_window_step=64, m_range=[60,123]
+ring_dimension=65536, depth=19, bootstrap_depth=16, levels_after_bootstrap=2, boot_iters=2, iterative_precision_bits=11, clear_imag=on, security=HEStd_128_classic, input_level=16
+OpenMP_max_threads=10
+max|alpha|=163.804, max|beta|=278.881, max|gamma|=211.28
+y_packing=on, y_slots=128, window_packing=on (one bootstrap per window)
+completed_steps=640
+max |u_ckks - u_plain|=1.132e-07
+max plant error inf=2.33745e-08
+max |u_ckks - u_formula| (per-step CKKS error)=1.84441e-06
+max u inactive-slot leakage=2.11007e-10
+bootstraps=9 (0.0140625 per step), mean_bootstrap_ms=6116.58
+steady_u_eval_ms mean=190.942 max=307.427
+min_feasible_sampling_period_ms=307.427
